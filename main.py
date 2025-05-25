@@ -22,7 +22,7 @@ class MinhaThread(threading.Thread):
         self.esta_ativa = True
         tempo_inicio = time.time()
         
-        while True:
+        while self.esta_ativa:
             # Calcula o tempo decorrido
             tempo_decorrido = time.time() - tempo_inicio
             # Calcula o progresso baseado no tempo
@@ -170,7 +170,9 @@ class Aplicacao:
         # Para todas as threads em execução
         for thread in self.threads:
             if thread.is_alive():
-                thread.join()
+                thread.esta_ativa = False
+                # Dá um pequeno tempo para a thread encerrar
+                thread.join(timeout=0.01)
         
         # Remove todos os frames
         for frame in self.thread_frames:
@@ -181,6 +183,10 @@ class Aplicacao:
         self.thread_frames.clear()
         self.thread_labels.clear()
         self.thread_progress.clear()
+        
+        # Pequeno delay para garantir que tudo foi limpo
+        self.root.update()
+        time.sleep(0.01)
     
     def iniciar_threads(self):
         # Reseta as barras de progresso
