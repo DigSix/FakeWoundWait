@@ -7,7 +7,7 @@ from datetime import datetime
 from queue import Queue
 
 class RecursoCompartilhavel:
-    def __init__(self, item_id):
+    def __init__(self, item_id, threads=None):
         self.item_id = item_id
         self.lock = "unlock"  # Pode ser "read_lock", "write_lock" ou "unlock"
         self.operation = None  # Pode ser "ler" ou "escrever"
@@ -15,6 +15,7 @@ class RecursoCompartilhavel:
         self.timestamp_thread = None
         self.fila = Queue()
         self.label = None  # Será configurado pela aplicação
+        self.threads = threads or []  # Lista de todas as threads
     
     def acessar(self, thread, operation):
         # Se o recurso está desbloqueado, permite o acesso imediatamente
@@ -38,6 +39,7 @@ class RecursoCompartilhavel:
     
     def liberar(self):
         # Primeiro reseta os valores padrão
+        thread_anterior = self.thread_acessando
         self.thread_acessando = None
         self.timestamp_thread = None
         self.operation = None
@@ -47,12 +49,52 @@ class RecursoCompartilhavel:
         if self.label:
             self.label.config(text=f"Recurso {self.item_id}: Desbloqueado")
         
-        # Verifica se tem thread na fila
-        if not self.fila.empty():
-            # Pega a próxima thread da fila
-            proxima_thread = self.fila.get()
-            # Chama acessar com os parâmetros da próxima thread
-            self.acessar(proxima_thread['thread'], proxima_thread['operation'])
+        # Notifica todas as threads que estão aguardando este recurso
+        threads_para_notificar = []
+        while not self.fila.empty():
+            thread_info = self.fila.get()
+            if thread_info['thread'].recursos_desejados and self in thread_info['thread'].recursos_desejados:
+                threads_para_notificar.append(thread_info)
+            else:
+                self.fila.put(thread_info)
+        
+        # Tenta dar acesso para a próxima thread
+        if threads_para_notificar:
+            # Ordena as threads por prioridade (timestamp)
+            threads_para_notificar.sort(key=lambda x: x['timestamp'])
+            proxima_thread = threads_para_notificar[0]
+            
+            # Coloca as outras threads de volta na fila
+            for thread_info in threads_para_notificar[1:]:
+                self.fila.put(thread_info)
+            
+            # Tenta dar acesso para a próxima thread
+            if self.acessar(proxima_thread['thread'], proxima_thread['operation']):
+                # Se conseguiu acessar, reseta o intervalo de tentativas da thread
+                proxima_thread['thread'].proximo_intervalo_acesso = random.uniform(
+                    proxima_thread['thread'].intervalo_min_acesso,
+                    proxima_thread['thread'].intervalo_max_acesso
+                )
+                proxima_thread['thread'].estado = "acessando_recursos"
+                proxima_thread['thread'].atualizar_cor_barra()
+                # Remove o recurso da lista de recursos desejados
+                if self in proxima_thread['thread'].recursos_desejados:
+                    proxima_thread['thread'].recursos_desejados.remove(self)
+        else:
+            # Se não tem threads para notificar, verifica se alguma thread está aguardando este recurso
+            for thread in self.threads:
+                if thread.recursos_desejados and self in thread.recursos_desejados:
+                    # Reseta o intervalo de tentativas da thread
+                    thread.proximo_intervalo_acesso = random.uniform(
+                        thread.intervalo_min_acesso,
+                        thread.intervalo_max_acesso
+                    )
+                    # Remove o recurso da lista de recursos desejados
+                    thread.recursos_desejados.remove(self)
+                    # Atualiza o estado da thread
+                    if not thread.recursos_desejados:
+                        thread.estado = "executando"
+                        thread.atualizar_cor_barra()
 
 class MinhaThread(threading.Thread):
     def __init__(self, nome, prioridade=None, label_status=None, progress_bar=None, recursos=None):
@@ -100,8 +142,9 @@ class MinhaThread(threading.Thread):
         self.recursos_acesso.clear()
         self.tempos_acesso.clear()
         self.recursos_desejados.clear()
-        self.estado = "executando"
-        self.atualizar_cor_barra()
+        if self.estado != "abortada":  # Só muda o estado se não estiver abortada
+            self.estado = "executando"
+            self.atualizar_cor_barra()
         self.proximo_intervalo_acesso = random.uniform(self.intervalo_min_acesso, self.intervalo_max_acesso)
     
     def verificar_tempo_acesso(self):
@@ -137,17 +180,21 @@ class MinhaThread(threading.Thread):
             # Lista todos os recursos disponíveis
             recursos_disponiveis = [r for r in self.recursos if r.lock == "unlock" and r not in self.recursos_acesso]
             
-            # Se tem pelo menos 2 recursos disponíveis
-            if len(recursos_disponiveis) >= 2:
+            # Se tem pelo menos 1 recurso disponível
+            if len(recursos_disponiveis) >= 1:
                 # Embaralha a lista de recursos disponíveis
                 random.shuffle(recursos_disponiveis)
-                # Pega os dois primeiros recursos da lista embaralhada
-                self.recursos_desejados = recursos_disponiveis[:2]
-                self.primeira_tentativa = False
-            # Se tem apenas 1 recurso disponível
-            elif len(recursos_disponiveis) == 1:
+                # Pega apenas o primeiro recurso da lista embaralhada
                 self.recursos_desejados = [recursos_disponiveis[0]]
                 self.primeira_tentativa = False
+            else:
+                # Se não tem recursos disponíveis, escolhe um recurso aleatório para aguardar
+                recursos_ocupados = [r for r in self.recursos if r.lock != "unlock"]
+                if recursos_ocupados:
+                    self.recursos_desejados = [random.choice(recursos_ocupados)]
+                    self.estado = "aguardando_recursos"
+                    self.atualizar_cor_barra()
+                    return False
         
         # Tenta acessar cada recurso na ordem
         recursos_acessados = False
@@ -187,9 +234,13 @@ class MinhaThread(threading.Thread):
         if self.recursos_desejados:
             self.estado = "aguardando_recursos"
             self.atualizar_cor_barra()
+            # Se está aguardando recursos, não tenta acessar novamente até que o recurso seja liberado
+            self.proximo_intervalo_acesso = float('inf')
         elif not self.recursos_acesso:
             self.estado = "executando"
             self.atualizar_cor_barra()
+            # Se não está acessando nem aguardando recursos, volta ao intervalo normal
+            self.proximo_intervalo_acesso = random.uniform(self.intervalo_min_acesso, self.intervalo_max_acesso)
         
         return recursos_acessados
     
@@ -230,6 +281,7 @@ class MinhaThread(threading.Thread):
         if self.label_status:
             self.label_status.config(text=f"Thread {self.nome}: Abortada!")
         self.esta_ativa = False  # Garante que a thread pare de executar
+        self.resultado = f"Thread {self.nome}: Abortada!"  # Atualiza o resultado final
     
     def run(self):
         self.esta_ativa = True
@@ -238,9 +290,6 @@ class MinhaThread(threading.Thread):
         self.ultima_tentativa_acesso = tempo_inicio
         
         try:
-            # Tenta acessar recursos logo no início
-            self.tentar_acessar_recursos()
-            
             while self.esta_ativa:
                 tempo_atual = time.time()
                 
@@ -251,7 +300,7 @@ class MinhaThread(threading.Thread):
                     status = f"Thread {self.nome} (Tempo: {self.tempo_total:.1f}s): {progresso:.1f}%"
                     if self.label_status:
                         self.label_status.config(text=status)
-                    if self.progress_bar:
+                    if self.progress_bar and self.estado != "abortada":
                         self.progress_bar["value"] = progresso
                     
                     if tempo_decorrido >= self.tempo_total:
@@ -266,8 +315,6 @@ class MinhaThread(threading.Thread):
                     status = f"Thread {self.nome}:\nAguardando: {', '.join(recursos_aguardando)}\nAcessando: {', '.join(recursos_acessando) if recursos_acessando else 'Nenhum'}"
                     if self.label_status:
                         self.label_status.config(text=status)
-                    # Tenta acessar os recursos disponíveis
-                    self.tentar_acessar_recursos()
                 
                 elif self.estado == "acessando_recursos":
                     self.tempo_pausa += (tempo_atual - ultimo_tempo)
@@ -286,13 +333,31 @@ class MinhaThread(threading.Thread):
         finally:
             # Só reseta os recursos se não estiver em deadlock
             if self.estado != "aguardando_recursos" or not self.recursos_desejados:
-                self.reset_recursos_acesso()
+                # Libera os recursos sem resetar o estado se estiver abortada
+                if self.estado == "abortada":
+                    for recurso in self.recursos_acesso:
+                        recurso.liberar()
+                    self.recursos_acesso.clear()
+                    self.tempos_acesso.clear()
+                    self.recursos_desejados.clear()
+                else:
+                    self.reset_recursos_acesso()
+                
                 if self.label_status:
-                    self.label_status.config(text=f"Thread {self.nome}: 100%")
+                    if self.estado == "abortada":
+                        self.label_status.config(text=f"Thread {self.nome}: Abortada!")
+                    else:
+                        self.label_status.config(text=f"Thread {self.nome}: 100%")
                 if self.progress_bar:
-                    self.progress_bar["value"] = 100
+                    if self.estado == "abortada":
+                        self.progress_bar["value"] = 100
+                        self.progress_bar.configure(style="Red.Horizontal.TProgressbar")
+                    else:
+                        self.progress_bar["value"] = 100
+                        self.progress_bar.configure(style="Horizontal.TProgressbar")
                 self.esta_ativa = False
-                self.resultado = f"Thread {self.nome} finalizou com sucesso!"
+                if not self.resultado:  # Só atualiza o resultado se não estiver abortada
+                    self.resultado = f"Thread {self.nome} finalizou com sucesso!"
                 if self.label_status:
                     self.label_status.config(text=self.resultado)
 
@@ -517,6 +582,10 @@ class Aplicacao:
             self.thread_labels.append(label)
             self.thread_progress.append(progress)
             self.threads.append(thread)
+            
+            # Atualiza a referência das threads nos recursos
+            for recurso in self.recursos.values():
+                recurso.threads = self.threads
         
         # Habilita botões
         self.btn_iniciar.config(state='normal')
@@ -544,7 +613,7 @@ class Aplicacao:
         # Limpa as listas
         self.threads.clear()
         self.thread_frames.clear()
-        self.thread_labels.clear()
+        self.thread_labels.clear() 
         self.thread_progress.clear()
         
         # Reseta o estado do deadlock
@@ -650,9 +719,40 @@ class Aplicacao:
         thread_continua = max(self.threads_deadlock, key=lambda t: t.prioridade)
         thread_abortada = next(t for t in self.threads_deadlock if t != thread_continua)
 
-        # Aborta a thread mais rápida e continua a mais lenta
+        # Aborta a thread mais rápida
         thread_abortada.morrer()
-        thread_continua.continuar()
+        
+        # Libera os recursos que a thread que continua estava acessando
+        for recurso in thread_continua.recursos_acesso:
+            recurso.liberar()
+        thread_continua.recursos_acesso.clear()
+        thread_continua.tempos_acesso.clear()
+        
+        # Reinicia a thread que deve continuar
+        thread_continua.estado = "executando"
+        thread_continua.atualizar_cor_barra()
+        thread_continua.tempo_inicio = time.time()
+        thread_continua.tempo_pausa = 0
+        thread_continua.ultima_tentativa_acesso = time.time()
+        thread_continua.proximo_intervalo_acesso = random.uniform(
+            thread_continua.intervalo_min_acesso,
+            thread_continua.intervalo_max_acesso
+        )
+        thread_continua.recursos_desejados = []
+        thread_continua.primeira_tentativa = True
+        thread_continua.esta_ativa = True
+        
+        # Preserva o tempo total original da thread
+        tempo_total_original = thread_continua.prioridade
+        thread_continua.tempo_total = tempo_total_original
+        
+        # Atualiza o status da thread
+        if thread_continua.label_status:
+            thread_continua.label_status.config(text=f"Thread {thread_continua.nome}: Continuando execução (Tempo restante: {tempo_total_original:.1f}s)")
+        
+        # Se a thread não estiver mais viva, reinicia ela
+        if not thread_continua.is_alive():
+            thread_continua.start()
 
         # Reseta o estado do deadlock
         self.deadlock_ativo = False
